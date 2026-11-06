@@ -44,6 +44,12 @@ cd qql-studio/src-tauri && cargo test --lib
 cd qql-studio && npm run check           # frontend type-check
 ```
 
+## Find family
+
+Open any seed and press **Find family** to search for new seeds that keep
+chosen properties of it — composition, colors or both, wide to close. See
+[docs/find-family.md](docs/find-family.md).
+
 ## How it works (one paragraph)
 
 QQL encodes 13 categorical traits in the last bytes of a 32-byte seed (ETH address + nonce + trait bits). `qqlrs-main` was extended to return rich `LayoutSummary` / `RenderData` (point counts, colors, radius buckets, quadrant distribution, and per-structure info for Formation / Orbital / Shadows pieces). The app's Rust backend filters candidate seeds in parallel against these characteristics and renders matches to PNG; the Svelte frontend drives the controls and a concurrency-limited render queue.
