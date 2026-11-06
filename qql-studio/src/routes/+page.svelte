@@ -638,7 +638,7 @@
 					if (renderRunStart === null) renderRunStart = performance.now();
 					if (familyRef) {
 						announceHits(add.length);
-						document.title = `(${results.length}) QQL Studio`;
+						document.title = `(${results.length}) QQL bjw`;
 					}
 				}
 			}
@@ -1215,7 +1215,7 @@
 			busy = false;
 			cancelling = false;
 			paused = false;
-			document.title = 'QQL Studio';
+			document.title = 'QQL bjw';
 		}
 	}
 
@@ -1385,14 +1385,14 @@
 </script>
 
 <svelte:head>
-	<title>QQL Studio</title>
+	<title>QQL bjw</title>
 </svelte:head>
 
 <div class="app">
 	<aside class="controls">
 		<header>
-			<h1>QQL Studio</h1>
-			<p class="sub">Trait-filtered seed explorer</p>
+			<h1>QQL bjw</h1>
+			<p class="sub">QQL Studio with Find family</p>
 		</header>
 
 		<section class="group group-setup">

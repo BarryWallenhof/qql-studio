@@ -1,5 +1,7 @@
 # QQL Studio
 
+> **This branch is QQL bjw**: QQL Studio plus *Find family*, installed as a separate app (`QQL bjw`, `com.qql.bjw`) so it can sit next to the official one.
+
 A macOS desktop app (Tauri 2 + Svelte 5) for filtering and rendering [QQL](https://qql.art) art seeds locally. You give it an ETH address, choose trait/characteristic filters, and it generates and renders matching seeds on your machine.
 
 Built on top of [@wchargin](https://github.com/wchargin)'s `qqlrs` Rust renderer (vendored here as `qqlrs-main/`, with local modifications — see [Licensing](#licensing)).
