@@ -88,7 +88,33 @@ export type LayoutStats = {
 	curveLength: number;
 	splatterOdds: number;
 	flow: FlowInfo;
+	/** Share of circle area per size, and the largest circle. */
+	sizeProfile: SizeProfile;
+	/** Every Find-family property of the piece. */
+	family: FamilyValues;
 };
+export type SizeProfile = {
+	areaSmallPct: number;
+	areaMediumPct: number;
+	areaLargePct: number;
+	maxRadiusPct: number;
+};
+/** Find-family properties by key; see src-tauri/src/family.rs for units. */
+export type FamilyValues = {
+	nums: Record<string, number>;
+	texts: Record<string, string>;
+	sets: Record<string, string[]>;
+	/** 3×3 circle coverage in percent, row by row from the top left. */
+	grid: number[] | null;
+};
+/** One Find-family condition, as the backend checks it. */
+export type FamilyConstraint =
+	| { kind: 'range'; key: string; min: number; max: number }
+	| { kind: 'oneOf'; key: string; values: number[] }
+	| { kind: 'equals'; key: string; value: string }
+	| { kind: 'near'; kx: string; ky: string; x: number; y: number; radius: number }
+	| { kind: 'sameSet'; key: string; values: string[] }
+	| { kind: 'gridNear'; values: number[]; tol: number };
 export type FlowInfo = {
 	linear: boolean;
 	/** Linear only: underlying line angle folded into 0–90° (0 = horizontal). */
@@ -204,6 +230,10 @@ export type GenerateRequest = {
 	minCenterY?: number;
 	maxCenterY?: number;
 	layoutTimeoutMs?: number;
+	/** Find family: conditions every hit must meet. */
+	family?: FamilyConstraint[];
+	/** Find family: CSV file name for the hits log in the app data folder. */
+	hitsLog?: string;
 };
 
 export type RenderResult = { pngDataUrl: string; stats: LayoutStats };
@@ -217,7 +247,26 @@ export type GenerateProgress = {
 	timedOut: number;
 	/** Seeds found since the previous update, in the order found. */
 	newCandidates: Candidate[];
+	/** Find family: seeds dropped per stage (traits, flow, colors & spacing,
+	 * structure settings, structure, start colors, layout). */
+	stageRejects: number[];
+	/** Find family: full layouts run. */
+	layoutRuns: number;
+	/** Search time so far, excluding pauses. */
+	elapsedMs: number;
+	paused: boolean;
 };
+
+export type ConstraintRate = { passed: number; total: number };
+export type EstimateOutcome = {
+	perConstraint: ConstraintRate[];
+	planAll: ConstraintRate;
+	layoutAll: ConstraintRate;
+	stageRejects: number[];
+	avgPlanMs: number;
+	avgLayoutMs: number;
+};
+export type SystemInfo = { cores: number; defaultWorkers: number };
 
 export type GenerateOutcome = {
 	candidates: Candidate[];
@@ -295,6 +344,20 @@ export const layoutSummary = (seedHex: string) =>
 	invoke<LayoutStats>('layout_summary', { seedHex });
 export const randomSeedForAddress = (address: string) =>
 	invoke<string>('random_seed_for_address', { address });
+
+// ---- Find family -------------------------------------------------------------
+export const pauseSearch = (paused: boolean) => invoke<void>('pause_search', { paused });
+export const familyHitsFolder = () => invoke<string>('family_hits_folder');
+export const systemInfo = () => invoke<SystemInfo>('system_info');
+export const estimateFamily = (request: {
+	address: string;
+	choices: TraitChoices;
+	constraints: FamilyConstraint[];
+	samples?: number;
+	planBudgetMs?: number;
+	layoutBudgetMs?: number;
+	workers?: number;
+}) => invoke<EstimateOutcome>('estimate_family', { request });
 
 export const emptyChoices = (): TraitChoices => ({
 	flowField: null,

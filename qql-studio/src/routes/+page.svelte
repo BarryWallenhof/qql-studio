@@ -12,7 +12,13 @@
 		listFavorites,
 		listTraits,
 		saveSeedPng,
+		estimateFamily,
+		familyHitsFolder,
+		pauseSearch,
+		systemInfo,
 		type Candidate,
+		type EstimateOutcome,
+		type SystemInfo,
 		type CharacteristicFilter,
 		type ColorInfo,
 		type GenerateMode,
@@ -25,6 +31,23 @@
 	import Tile from '$lib/Tile.svelte';
 	import FilterInfo from '$lib/FilterInfo.svelte';
 	import Detail from '$lib/Detail.svelte';
+	import FamilyPanel from '$lib/FamilyPanel.svelte';
+	import {
+		COLOR_TRAITS,
+		STAGE_NAMES,
+		buildConstraints,
+		duration,
+		oneIn,
+		skippedRows,
+		startStates,
+		summaryLines,
+		type Aspect,
+		type Closeness,
+		type LockDef,
+		type LockState
+	} from '$lib/family';
+	import { revealItemInDir } from '@tauri-apps/plugin-opener';
+	import { getCurrentWindow, UserAttentionType } from '@tauri-apps/api/window';
 	import { dropQueuedRenders, setRenderConcurrency, withPriority } from '$lib/renderQueue';
 
 	const LS_KEY = 'qql-studio.v1';
@@ -598,6 +621,9 @@
 		filtersRestored = true;
 		traitsMeta = await listTraits();
 		paletteColors = await listPaletteColors();
+		systemInfo()
+			.then((i) => (sysInfo = i))
+			.catch(() => {});
 		unlisten = await listen<GenerateProgress>('search-progress', (event) => {
 			progress = event.payload;
 			// Show seeds as they're found. The final result list replaces this
@@ -610,6 +636,10 @@
 				if (add.length > 0) {
 					results = [...results, ...add];
 					if (renderRunStart === null) renderRunStart = performance.now();
+					if (familyRef) {
+						announceHits(add.length);
+						document.title = `(${results.length}) QQL Studio`;
+					}
 				}
 			}
 		});
@@ -871,7 +901,187 @@
 		return charFilter;
 	}
 
+	// ---- Find family ---------------------------------------------
+	// A reference seed plus row settings replace the sidebar filters. Rows copy
+	// values from the reference (colors optionally from a second seed); the
+	// backend checks them stage by stage.
+	let familyRef = $state<Candidate | null>(null);
+	let colorSource = $state<Candidate | null>(null);
+	let famAspect = $state<Aspect>('composition');
+	let famCloseness = $state<Closeness>('middle');
+	let famStates = $state<Record<string, LockState>>(startStates('composition', 'middle'));
+	let estimate = $state<EstimateOutcome | null>(null);
+	let estimateKey = $state('');
+	let estimating = $state(false);
+	let estimateError = $state<string | null>(null);
+	let paused = $state(false);
+	let sysInfo = $state<SystemInfo | null>(null);
+	let soundOnHit = $state(true);
+	let hitsLogPath = $state<string | null>(null);
+
+	const TRAIT_KEYS = Object.keys(emptyChoices()) as (keyof TraitChoices)[];
+	function famSource(def: LockDef): Candidate {
+		return def.aspect === 'colors' && colorSource ? colorSource : familyRef!;
+	}
+	function famRefSource(def: LockDef) {
+		const c = famSource(def);
+		return c.stats?.family ? { values: c.stats.family, traits: c.traits } : null;
+	}
+	const famSkipped = $derived.by(() =>
+		familyRef ? skippedRows(choices, (d) => famSource(d).traits) : {}
+	);
+	const famBuilt = $derived.by(() =>
+		familyRef
+			? buildConstraints(
+					famRefSource,
+					famStates,
+					new Set(Object.keys(famSkipped))
+				)
+			: []
+	);
+	const famSummary = $derived.by(() =>
+		familyRef
+			? summaryLines(famRefSource, famStates, famSkipped)
+			: { kept: [], free: [] }
+	);
+	const famKey = $derived(
+		JSON.stringify({ c: famBuilt.map((b) => b.constraint), t: choices, a: address })
+	);
+	const estimateStale = $derived(estimate !== null && estimateKey !== famKey);
+
+	// Traits for a family search: everything from the reference, except the
+	// color traits, which follow the colors (kept: from the color source; not
+	// kept: Any, for more variety at no extra cost).
+	function familyChoices(aspect: Aspect): TraitChoices {
+		const t = familyRef!.traits as unknown as Record<string, unknown>;
+		const tc = (colorSource ?? familyRef!).traits as unknown as Record<string, unknown>;
+		const next = emptyChoices() as unknown as Record<string, unknown>;
+		for (const k of TRAIT_KEYS) next[k] = t[k];
+		for (const k of COLOR_TRAITS) next[k] = aspect === 'composition' ? null : tc[k];
+		return next as unknown as TraitChoices;
+	}
+	function applyStart(aspect: Aspect, closeness: Closeness) {
+		famAspect = aspect;
+		famCloseness = closeness;
+		famStates = startStates(aspect, closeness);
+		if (familyRef) choices = familyChoices(aspect);
+	}
+	function startFamily(c: Candidate, keepSettings = false) {
+		if (!c.stats?.family) return;
+		familyRef = c;
+		if (!keepSettings) {
+			colorSource = null;
+			applyStart(famAspect, famCloseness);
+		} else {
+			choices = familyChoices(famAspect);
+		}
+		estimate = null;
+		estimateError = null;
+		openDetail = null;
+		if (/^0x[0-9a-fA-F]{40}$/.test(address.trim())) runEstimate();
+	}
+	function useColorsFrom(c: Candidate) {
+		if (!familyRef || !c.stats?.family) return;
+		colorSource = c;
+		if (famAspect === 'composition') {
+			famAspect = 'both';
+			famStates = startStates('both', famCloseness);
+		}
+		choices = familyChoices(famAspect);
+		openDetail = null;
+	}
+	function clearColorSource() {
+		colorSource = null;
+		if (familyRef) choices = familyChoices(famAspect);
+	}
+	function exitFamily() {
+		familyRef = null;
+		colorSource = null;
+		estimate = null;
+	}
+	async function runEstimate() {
+		if (!familyRef || estimating) return;
+		estimating = true;
+		estimateError = null;
+		const key = famKey;
+		try {
+			estimate = await estimateFamily({
+				address,
+				choices,
+				constraints: famBuilt.map((b) => b.constraint),
+				workers: workers >= 1 ? Math.floor(workers) : undefined
+			});
+			estimateKey = key;
+		} catch (e) {
+			estimateError = String(e);
+		} finally {
+			estimating = false;
+		}
+	}
+	async function togglePause() {
+		paused = !paused;
+		try {
+			await pauseSearch(paused);
+		} catch {}
+	}
+	async function openHitsFolder() {
+		try {
+			const dir = hitsLogPath ?? (await familyHitsFolder());
+			await revealItemInDir(dir);
+		} catch (e) {
+			error = `Couldn't open the hits folder: ${e}`;
+		}
+	}
+	// A short two-note chime for new hits (no files, no permissions).
+	let audio: AudioContext | null = null;
+	function chime() {
+		try {
+			audio ??= new AudioContext();
+			const t = audio.currentTime;
+			for (const [i, f] of [660, 990].entries()) {
+				const o = audio.createOscillator();
+				const g = audio.createGain();
+				o.frequency.value = f;
+				g.gain.setValueAtTime(0.0001, t + i * 0.12);
+				g.gain.exponentialRampToValueAtTime(0.15, t + i * 0.12 + 0.02);
+				g.gain.exponentialRampToValueAtTime(0.0001, t + i * 0.12 + 0.3);
+				o.connect(g).connect(audio.destination);
+				o.start(t + i * 0.12);
+				o.stop(t + i * 0.12 + 0.32);
+			}
+		} catch {}
+	}
+	function announceHits(n: number) {
+		if (!familyRef) return;
+		if (soundOnHit) chime();
+		if (document.hidden) {
+			getCurrentWindow()
+				.requestUserAttention(UserAttentionType.Informational)
+				.catch(() => {});
+		}
+		void n;
+	}
+	const famRate = $derived.by(() => {
+		if (!progress || progress.found === 0) return null;
+		return progress.found / Math.max(1, progress.attempts);
+	});
+	const famPerHit = $derived.by(() => {
+		if (!progress || progress.found === 0 || progress.elapsedMs <= 0) return null;
+		return progress.elapsedMs / 1000 / progress.found;
+	});
+	const famSpeed = $derived.by(() => {
+		if (!progress || progress.elapsedMs <= 500) return null;
+		return progress.attempts / (progress.elapsedMs / 1000);
+	});
+	const famFunnel = $derived.by(() => {
+		if (!progress?.stageRejects || progress.attempts === 0) return [];
+		return progress.stageRejects
+			.map((n, i) => ({ name: STAGE_NAMES[i], pct: (100 * n) / progress!.attempts }))
+			.filter((x) => x.pct > 0);
+	});
+
 	async function onGenerate() {
+		if (familyRef) return onFamilyGenerate();
 		error = null;
 		statusMsg = '';
 		const cf = buildCharFilter();
@@ -945,6 +1155,67 @@
 		} finally {
 			busy = false;
 			cancelling = false;
+		}
+	}
+
+	async function onFamilyGenerate() {
+		error = null;
+		statusMsg = '';
+		if (famBuilt.length === 0) {
+			error = 'Switch on at least one row in Find family, or close it to use the normal filters.';
+			return;
+		}
+		progress = null;
+		results = [];
+		lastSearch = null;
+		searchStartedAt = performance.now();
+		dropQueuedRenders();
+		renderedCount = 0;
+		renderRunStart = null;
+		renderRunDuration = null;
+		cancelling = false;
+		paused = false;
+		busy = true;
+		const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..*/, '').replace('T', '-');
+		const logName = `family-${stamp}.csv`;
+		try {
+			const dir = await familyHitsFolder().catch(() => null);
+			hitsLogPath = dir ? `${dir}/${logName}` : null;
+			const outcome = await generateCandidates({
+				address,
+				choices,
+				mode,
+				count: Math.floor(count),
+				// Runs until enough hits are found or Stop is pressed.
+				maxAttempts: undefined,
+				workers: workers >= 1 ? Math.floor(workers) : undefined,
+				runLayout: false,
+				family: famBuilt.map((b) => b.constraint),
+				hitsLog: logName,
+				layoutTimeoutMs:
+					layoutTimeoutEnabled && layoutTimeoutSeconds > 0
+						? Math.round(layoutTimeoutSeconds * 1000)
+						: undefined
+			});
+			results = outcome.candidates;
+			lastSearch = {
+				attempts: outcome.attempts,
+				maxAttempts: outcome.maxAttempts,
+				cancelled: outcome.cancelled,
+				timedOut: outcome.timedOut
+			};
+			const rate = results.length > 0 ? ` (1 in ${hitRate(outcome.attempts, results.length)})` : '';
+			statusMsg = outcome.cancelled
+				? `Stopped. Found ${results.length} family members in ${outcome.attempts.toLocaleString()} seeds${rate}.`
+				: `Found ${results.length} family members in ${outcome.attempts.toLocaleString()} seeds${rate}.`;
+			if (results.length > 0 && renderRunStart === null) renderRunStart = performance.now();
+		} catch (e) {
+			error = String(e);
+		} finally {
+			busy = false;
+			cancelling = false;
+			paused = false;
+			document.title = 'QQL Studio';
 		}
 	}
 
@@ -1221,6 +1492,28 @@
 			</div>
 		</section>
 
+		{#if familyRef}
+			<FamilyPanel
+				reference={familyRef}
+				{colorSource}
+				aspect={famAspect}
+				closeness={famCloseness}
+				bind:states={famStates}
+				skipped={famSkipped}
+				built={famBuilt}
+				summary={famSummary}
+				{address}
+				{workers}
+				{estimate}
+				{estimateStale}
+				{estimating}
+				{estimateError}
+				onStart={applyStart}
+				onEstimate={runEstimate}
+				onClearColorSource={clearColorSource}
+				onExit={exitFamily}
+			/>
+		{:else}
 		<div class="filters-bar">
 			<span>Filters <small>remembered between sessions</small></span>
 			<button class="ghost" onclick={resetAllFilters}>Reset all filters</button>
@@ -1950,6 +2243,8 @@
 			</div>
 		</section>
 
+		{/if}
+
 		<section class="group group-generation">
 			<div class="section-head">
 				<h2>Generate</h2>
@@ -1970,7 +2265,7 @@
 					<input
 						type="number"
 						bind:value={maxAttempts}
-						placeholder="auto"
+						placeholder={familyRef ? 'until stopped' : 'auto'}
 						min="1"
 					/>
 				</label>
@@ -1987,6 +2282,27 @@
 					max="16"
 					step="1"
 				/>
+				{#if sysInfo}
+					<div class="workers-presets">
+						<button
+							class="ghost"
+							class:on={workers === Math.max(1, Math.floor(sysInfo.cores / 2))}
+							onclick={() => (workers = Math.max(1, Math.floor(sysInfo!.cores / 2)))}
+							title="Half of your processor cores: quieter and cooler"
+						>
+							Cool · {Math.max(1, Math.floor(sysInfo.cores / 2))}
+						</button>
+						<button
+							class="ghost"
+							class:on={workers === sysInfo.defaultWorkers}
+							onclick={() => (workers = sysInfo!.defaultWorkers)}
+							title="All cores but two: fastest while staying usable"
+						>
+							Fast · {sysInfo.defaultWorkers}
+						</button>
+						<span class="muted-small">of {sysInfo.cores} cores</span>
+					</div>
+				{/if}
 				<div class="workers-hint">
 					{#if workers <= 2}
 						light — leaves most of your CPU free for other apps
@@ -2031,13 +2347,31 @@
 					</div>
 				</label>
 			{/if}
+			{#if familyRef}
+				<label class="checkbox">
+					<input type="checkbox" bind:checked={soundOnHit} />
+					<span>Chime on each hit</span>
+				</label>
+			{/if}
 			{#if busy}
-				<button class="cancel" onclick={onCancel} disabled={cancelling}>
-					{cancelling ? 'Cancelling…' : 'Cancel'}
-				</button>
+				<div class="run-row">
+					<button class="cancel" onclick={onCancel} disabled={cancelling}>
+						{cancelling ? 'Stopping…' : familyRef ? 'Stop' : 'Cancel'}
+					</button>
+					{#if familyRef}
+						<button class="ghost" onclick={togglePause} disabled={cancelling}>
+							{paused ? '▶ Resume' : '❚❚ Pause'}
+						</button>
+					{/if}
+				</div>
 			{:else}
 				<button class="primary" onclick={onGenerate} disabled={!address}>
-					Generate
+					{familyRef ? `Find ${Math.floor(count)} family members` : 'Generate'}
+				</button>
+			{/if}
+			{#if familyRef}
+				<button class="ghost hits-folder" onclick={openHitsFolder} title="Every hit is also written to a CSV file here, so long runs survive closing the app">
+					Open hits folder
 				</button>
 			{/if}
 			{#if busy}
@@ -2054,7 +2388,23 @@
 							<strong>{progress?.found ?? 0}</strong> / {progress?.want ?? count}
 						</span>
 					</div>
-					{#if progress && (progress.found > 0 || progress.timedOut > 0)}
+					{#if familyRef && progress}
+					<div class="progress-line sub">
+						{#if paused}<span class="paused">paused</span> ·{/if}
+						{#if famSpeed}<span>{Math.round(famSpeed).toLocaleString()} seeds/s</span>{/if}
+						{#if progress.elapsedMs > 0}<span>· {duration(progress.elapsedMs / 1000)}</span>{/if}
+						{#if famRate}<span>· {oneIn(famRate)}</span>{/if}
+						{#if famPerHit}<span>· {duration(famPerHit)} per hit</span>{/if}
+					</div>
+					{#if famFunnel.length > 0}
+						<div class="progress-line sub funnel-line">
+							dropped at:
+							{#each famFunnel as f, i}
+								<span>{i > 0 ? '·' : ''} {f.name} {f.pct >= 1 ? f.pct.toFixed(0) : f.pct.toFixed(1)}%</span>
+							{/each}
+						</div>
+					{/if}
+				{:else if progress && (progress.found > 0 || progress.timedOut > 0)}
 						<div class="progress-line sub">
 							{#if progress.found > 0}
 								<span>1 in {hitRate(progress.attempts, progress.found)}</span>
@@ -2073,8 +2423,9 @@
 							style="width: {progress
 								? Math.min(
 										100,
-										(progress.attempts / Math.max(1, progress.maxAttempts)) *
-											100
+										familyRef
+											? (progress.found / Math.max(1, progress.want)) * 100
+											: (progress.attempts / Math.max(1, progress.maxAttempts)) * 100
 									)
 								: 0}%"
 						></div>
@@ -2199,6 +2550,10 @@
 			favorited={favorites.has(openDetail.seed)}
 			onClose={() => (openDetail = null)}
 			onToggleFavorite={() => toggleFavorite(openDetail!.seed)}
+			onFindFamily={familyRef ? undefined : (c) => startFamily(c)}
+			reference={familyRef}
+			onUseAsReference={familyRef ? (c) => startFamily(c, true) : undefined}
+			onUseColors={familyRef ? (c) => useColorsFrom(c) : undefined}
 		/>
 		{/key}
 	{/if}
@@ -2915,6 +3270,39 @@
 	section.group-colors {
 		background: #1e141a;
 		border-left-color: #e16a99;
+	}
+	.workers-presets {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		margin-top: 4px;
+	}
+	.workers-presets button.on {
+		background: #2f6f78;
+		border-color: #3c8f9a;
+		color: #effcff;
+	}
+	.muted-small {
+		color: #666;
+		font-size: 11px;
+	}
+	.run-row {
+		display: flex;
+		gap: 8px;
+	}
+	.run-row .cancel {
+		flex: 1;
+	}
+	.hits-folder {
+		align-self: flex-start;
+		font-size: 11.5px;
+	}
+	.paused {
+		color: #e0a14f;
+	}
+	.funnel-line {
+		flex-wrap: wrap;
+		color: #777;
 	}
 	section.group-generation {
 		background: #1e1a14;

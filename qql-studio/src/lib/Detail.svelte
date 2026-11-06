@@ -24,6 +24,14 @@
 		position?: string | null;
 		onPrev?: () => void;
 		onNext?: () => void;
+		/** start Find family from this seed. */
+		onFindFamily?: (c: Candidate) => void;
+		/** while Find family runs — the reference, for comparing. */
+		reference?: Candidate | null;
+		/** make this seed the new reference, keeping the settings. */
+		onUseAsReference?: (c: Candidate) => void;
+		/** keep the reference's composition but take this seed's colors. */
+		onUseColors?: (c: Candidate) => void;
 	};
 	let {
 		candidate,
@@ -32,8 +40,39 @@
 		onToggleFavorite,
 		position = null,
 		onPrev,
-		onNext
+		onNext,
+		onFindFamily,
+		reference = null,
+		onUseAsReference,
+		onUseColors
 	}: Props = $props();
+
+	// ---- Compare with the Find-family reference ------------------
+	const canCompare = $derived(!!reference && reference.seed !== candidate.seed);
+	let compare = $state<'off' | 'side' | 'flip'>('off');
+	let refUrl = $state<string | null>(null);
+	let flipShowRef = $state(false);
+	let flipTimer: ReturnType<typeof setInterval> | null = null;
+	async function loadReference() {
+		if (!reference || refUrl || previewWidth == null) return;
+		try {
+			const r = await withPriority(() => renderSeed(reference!.seed, previewWidth!, false));
+			refUrl = r.pngDataUrl;
+		} catch {}
+	}
+	function setCompare(mode: 'off' | 'side' | 'flip') {
+		compare = compare === mode ? 'off' : mode;
+		if (flipTimer) {
+			clearInterval(flipTimer);
+			flipTimer = null;
+		}
+		flipShowRef = false;
+		if (compare !== 'off') loadReference();
+		if (compare === 'flip') flipTimer = setInterval(() => (flipShowRef = !flipShowRef), 800);
+	}
+	onDestroy(() => {
+		if (flipTimer) clearInterval(flipTimer);
+	});
 
 	let copied = $state<'' | 'ok' | 'failed'>('');
 	function onKey(e: KeyboardEvent) {
@@ -312,7 +351,23 @@
 <div class="backdrop" onclick={onClose} role="presentation"></div>
 <div class="panel" role="dialog" aria-modal="true">
 	<div class="art-pane" bind:this={artPane}>
-		{#if frames && showAnim}
+		{#if compare === 'side' && pngUrl}
+			<div class="compare-side">
+				<figure>
+					{#if refUrl}<img src={refUrl} alt="Reference" />{:else}<div class="placeholder">rendering…</div>{/if}
+					<figcaption>reference</figcaption>
+				</figure>
+				<figure>
+					<img src={pngUrl} alt="This seed" />
+					<figcaption>this seed</figcaption>
+				</figure>
+			</div>
+		{:else if compare === 'flip' && pngUrl}
+			<figure class="compare-flip">
+				<img src={flipShowRef && refUrl ? refUrl : pngUrl} alt="Compare" />
+				<figcaption>{flipShowRef && refUrl ? 'reference' : 'this seed'}</figcaption>
+			</figure>
+		{:else if frames && showAnim}
 			<img src={frames[frameIdx]} alt="QQL animation frame" />
 		{:else if pngUrl}
 			<img src={pngUrl} alt="QQL render" />
@@ -386,6 +441,46 @@
 				{showAnim ? '▾ Animate' : '▸ Animate'}
 			</button>
 		</div>
+		{#if onFindFamily || canCompare || onUseAsReference || onUseColors}
+			<div class="actions family-actions">
+				{#if onFindFamily}
+					<button
+						class="primary"
+						onclick={() => onFindFamily?.({ ...candidate, stats: stats ?? candidate.stats })}
+						disabled={!stats}
+						title="Search for seeds that share chosen properties with this one"
+					>
+						Find family
+					</button>
+				{/if}
+				{#if canCompare}
+					<button class:on={compare === 'side'} onclick={() => setCompare('side')} title="Show the reference next to this seed">
+						Side by side
+					</button>
+					<button class:on={compare === 'flip'} onclick={() => setCompare('flip')} title="Switch between this seed and the reference">
+						Flip
+					</button>
+				{/if}
+				{#if onUseAsReference && canCompare}
+					<button
+						onclick={() => onUseAsReference?.({ ...candidate, stats: stats ?? candidate.stats })}
+						disabled={!stats}
+						title="Make this seed the reference and keep searching with the same settings"
+					>
+						More like this
+					</button>
+				{/if}
+				{#if onUseColors && canCompare}
+					<button
+						onclick={() => onUseColors?.({ ...candidate, stats: stats ?? candidate.stats })}
+						disabled={!stats}
+						title="Keep the reference's composition, take this seed's colors"
+					>
+						Use its colors
+					</button>
+				{/if}
+			</div>
+		{/if}
 		{#if saveNote}
 			<div class="save-note" class:err={saveNote.err}>{saveNote.text}</div>
 		{/if}
@@ -681,6 +776,13 @@
 
 <style>
 	.muted { color: #777; font-weight: 400; }
+	.family-actions { margin-top: 8px; }
+	button.on { background: #2f6f78; border-color: #3c8f9a; color: #effcff; }
+	.compare-side { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; width: 100%; height: 100%; }
+	.compare-side figure, .compare-flip { margin: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 0; gap: 6px; }
+	.compare-side img, .compare-flip img { max-width: 100%; max-height: calc(100% - 24px); object-fit: contain; }
+	.compare-flip { width: 100%; height: 100%; }
+	figcaption { font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: 0.06em; }
 	.stat-sec { margin: 14px 0 4px; padding-top: 10px; border-top: 1px solid #222; }
 	.stat-sec h4 { margin: 0 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #888; font-weight: 600; }
 	.stat-sec .row { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; font-size: 12.5px; padding: 2px 0; }
