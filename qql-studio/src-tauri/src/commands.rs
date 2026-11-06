@@ -1,5 +1,6 @@
 //! Tauri commands exposed to the frontend.
 
+use crate::family::{self, FamilyConstraint, LayoutFacts, StagedFamily, View};
 use crate::render::{self, LayoutStats, RenderResult, StructureStats};
 use crate::seed::{
     build_seed, matches_filter, parse_address, parse_seed_hex, random_nonce,
@@ -19,6 +20,10 @@ use tauri::{AppHandle, Emitter};
 /// Global cancel flag for the in-flight search. Only one search runs at a time
 /// from a single window, so a single flag is sufficient.
 static CANCEL: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
+
+/// Set while the user has paused the running search. Workers wait
+/// instead of taking new seeds; the elapsed-time clock stops.
+static PAUSED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -59,6 +64,14 @@ pub struct GenerateRequest {
     /// If `Some`, bail out of any individual layout that takes longer than
     /// this many milliseconds. Skipped layouts still count as attempts.
     pub layout_timeout_ms: Option<u32>,
+    /// Find family: when `Some`, seeds must satisfy every
+    /// condition; the sidebar's characteristic filters are not used.
+    #[serde(default)]
+    pub family: Option<Vec<FamilyConstraint>>,
+    /// Find family: file name (in the app's data folder) to append each hit
+    /// to as it's found, so long runs survive closing the app.
+    #[serde(default)]
+    pub hits_log: Option<String>,
 }
 
 #[derive(Deserialize, Debug, PartialEq, Eq)]
@@ -788,6 +801,13 @@ pub struct GenerateProgress {
     /// Seeds found since the previous update, in the order found, so the UI
     /// can show results while the search is still running.
     pub new_candidates: Vec<Candidate>,
+    /// Find family: seeds dropped per stage (see `family::STAGE_*`).
+    pub stage_rejects: Vec<usize>,
+    /// Find family: full layouts run (seeds that passed every earlier check).
+    pub layout_runs: usize,
+    /// Time spent searching, excluding pauses.
+    pub elapsed_ms: u64,
+    pub paused: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -808,10 +828,15 @@ pub async fn generate_candidates(
     request: GenerateRequest,
 ) -> Result<GenerateOutcome, String> {
     CANCEL.store(false, Ordering::SeqCst);
+    PAUSED.store(false, Ordering::SeqCst);
     clear_thumb_cache();
     let app_clone = app.clone();
+    let hits_log = request
+        .hits_log
+        .as_deref()
+        .and_then(|name| family_hits_path(&app, name));
     let result = tauri::async_runtime::spawn_blocking(move || {
-        generate_candidates_inner(request, move |progress| {
+        generate_candidates_logged(request, hits_log, move |progress| {
             let _ = app_clone.emit("search-progress", progress);
         })
     })
@@ -834,6 +859,116 @@ pub fn session_id() -> String {
 #[tauri::command]
 pub fn cancel_search() {
     CANCEL.store(true, Ordering::SeqCst);
+}
+
+/// Pause or resume the running search.
+#[tauri::command]
+pub fn pause_search(paused: bool) {
+    PAUSED.store(paused, Ordering::SeqCst);
+}
+
+/// Folder where Find-family runs log their hits.
+fn family_hits_dir(app: &AppHandle) -> Option<std::path::PathBuf> {
+    use tauri::Manager;
+    let dir = app.path().app_data_dir().ok()?.join("family-hits");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// Log file for one run: only a plain file name is accepted.
+fn family_hits_path(app: &AppHandle, name: &str) -> Option<std::path::PathBuf> {
+    let safe = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !name.starts_with('.')
+        && name.ends_with(".csv");
+    if !safe {
+        return None;
+    }
+    Some(family_hits_dir(app)?.join(name))
+}
+
+/// The hits log folder, for the "Open hits folder" button.
+#[tauri::command]
+pub fn family_hits_folder(app: AppHandle) -> Result<String, String> {
+    family_hits_dir(&app)
+        .map(|p| p.to_string_lossy().into_owned())
+        .ok_or_else(|| "could not create the hits folder".into())
+}
+
+/// Cores available and the default worker count, for the Cool / Fast switch
+///.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemInfo {
+    pub cores: usize,
+    pub default_workers: usize,
+}
+
+#[tauri::command]
+pub fn system_info() -> SystemInfo {
+    SystemInfo {
+        cores: std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4),
+        default_workers: default_worker_count(),
+    }
+}
+
+/// Request for [`estimate_family`].
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct EstimateRequest {
+    pub address: String,
+    pub choices: TraitChoices,
+    pub constraints: Vec<FamilyConstraint>,
+    pub samples: Option<usize>,
+    pub plan_budget_ms: Option<u64>,
+    pub layout_budget_ms: Option<u64>,
+    pub workers: Option<usize>,
+}
+
+/// Estimate how often the family conditions hold, by sampling seeds made the
+/// way the search makes them.
+#[tauri::command]
+pub async fn estimate_family(
+    request: EstimateRequest,
+) -> Result<family::EstimateOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || estimate_family_inner(request))
+        .await
+        .map_err(|e| format!("worker join error: {e}"))?
+}
+
+fn estimate_family_inner(request: EstimateRequest) -> Result<family::EstimateOutcome, String> {
+    let address = parse_address(&request.address).map_err(|e| e.to_string())?;
+    let mut rng = StdRng::from_entropy();
+    let workers = request
+        .workers
+        .filter(|w| (1..=64).contains(w))
+        .unwrap_or_else(default_worker_count);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .build()
+        .map_err(|e| format!("failed to build thread pool: {e}"))?;
+    let opts = family::EstimateOptions {
+        samples: request.samples.unwrap_or(2000).clamp(100, 50_000),
+        plan_budget: Duration::from_millis(request.plan_budget_ms.unwrap_or(6000).min(60_000)),
+        layout_budget: Duration::from_millis(request.layout_budget_ms.unwrap_or(6000).min(60_000)),
+        max_tried: 5_000_000,
+    };
+    let choices = &request.choices;
+    family::estimate(
+        &request.constraints,
+        render::color_db(),
+        &qql::config::Config::default(),
+        &pool,
+        &opts,
+        || {
+            let nonce = random_nonce(&mut rng);
+            let resolved = resolve_choices(choices, &mut rng).map_err(|e| e.to_string())?;
+            build_seed(&address, &nonce, &resolved).map_err(|e| e.to_string())
+        },
+    )
 }
 
 /// Compute the underlying linear flow-line angle (in degrees, range [0, 90])
@@ -956,8 +1091,21 @@ fn make_seed(
     }
 }
 
-fn generate_candidates_inner<F>(
+pub(crate) fn generate_candidates_inner<F>(
     request: GenerateRequest,
+    on_progress: F,
+) -> anyhow::Result<GenerateOutcome>
+where
+    F: Fn(GenerateProgress) + Send + Sync + 'static,
+{
+    generate_candidates_logged(request, None, on_progress)
+}
+
+/// Like [`generate_candidates_inner`], appending each hit's seed to
+/// `hits_log` (if given) as it's found.
+fn generate_candidates_logged<F>(
+    request: GenerateRequest,
+    hits_log: Option<std::path::PathBuf>,
     on_progress: F,
 ) -> anyhow::Result<GenerateOutcome>
 where
@@ -968,14 +1116,36 @@ where
     let rng = StdRng::seed_from_u64(seed_for_rng);
 
     let want = request.count.clamp(1, 2048);
-    let max_attempts = request
-        .max_attempts
-        .unwrap_or(want.saturating_mul(200).max(1000))
-        .max(want);
+    // Find family: its own conditions replace the sidebar filters,
+    // and a run goes on until enough hits are found or it's stopped.
+    let family_cons: Option<&[FamilyConstraint]> = request.family.as_deref();
+    let family = family_cons.map(StagedFamily::new);
+    let family_limits = family_cons.map(family::layout_limits).unwrap_or_default();
+    let stage_rejects = Arc::new(family::new_stage_counters());
+    let layout_runs = Arc::new(AtomicUsize::new(0));
+    let default_max = if family.is_some() {
+        2_000_000_000_000
+    } else {
+        want.saturating_mul(200).max(1000)
+    };
+    let max_attempts = request.max_attempts.unwrap_or(default_max).max(want);
+    let hits_log = hits_log.and_then(|path| {
+        let new = !path.exists();
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok()?;
+        if new {
+            use std::io::Write;
+            let _ = writeln!(f, "seed,found_at_unix");
+        }
+        Some(Mutex::new(f))
+    });
     let char_filter = request
         .characteristic_filter
         .as_ref()
-        .filter(|f| f.is_active());
+        .filter(|f| f.is_active() && family.is_none());
     // Structure filters are checked from a cheap pre-layout replay; only the
     // point-level filters (or the "run layout" option) need a full layout.
     let structure_filter = char_filter.filter(|f| f.structure_active());
@@ -1028,6 +1198,8 @@ where
     // A dedicated emitter sends regular progress updates (and passes Cancel
     // on to `stop`, so layouts in progress hear about it within ~60 ms).
     let emitter_handle = {
+        let stage_rejects = stage_rejects.clone();
+        let layout_runs = layout_runs.clone();
         let attempts_atomic = attempts_atomic.clone();
         let found_atomic = found_atomic.clone();
         let timed_out = timed_out.clone();
@@ -1045,9 +1217,22 @@ where
                     want,
                     timed_out: 0,
                     new_candidates: Vec::new(),
+                    stage_rejects: vec![0; family::NUM_STAGES],
+                    layout_runs: 0,
+                    elapsed_ms: 0,
+                    paused: false,
                 });
+                // Active search time: the clock stops while paused.
+                let mut active = Duration::ZERO;
+                let mut last = std::time::Instant::now();
                 while !emitter_done.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(60));
+                    let now = std::time::Instant::now();
+                    let paused = PAUSED.load(Ordering::Relaxed);
+                    if !paused {
+                        active += now - last;
+                    }
+                    last = now;
                     if CANCEL.load(Ordering::Relaxed) {
                         stop.store(true, Ordering::Relaxed);
                     }
@@ -1058,6 +1243,10 @@ where
                         want,
                         timed_out: timed_out.load(Ordering::Relaxed),
                         new_candidates: std::mem::take(&mut *pending_found.lock().unwrap()),
+                        stage_rejects: family::load_stage_counters(&stage_rejects),
+                        layout_runs: layout_runs.load(Ordering::Relaxed),
+                        elapsed_ms: active.as_millis() as u64,
+                        paused,
                     });
                 }
             })
@@ -1068,7 +1257,39 @@ where
     let evaluate = |seed: &[u8; 32]| -> Option<Candidate> {
         let traits = q::Traits::from_seed(seed);
         if !matches_filter(&traits, &request.choices) {
+            stage_rejects[family::STAGE_TRAITS].fetch_add(1, Ordering::Relaxed);
             return None;
+        }
+        if let Some(fam) = family.as_ref() {
+            // Find family: cheap staged checks first, then one layout.
+            let db = render::color_db();
+            let plan = fam.plan(seed, db, &stage_rejects)?;
+            layout_runs.fetch_add(1, Ordering::Relaxed);
+            let deadline = layout_timeout.map(|d| std::time::Instant::now() + d);
+            let Some(summary) = render::layout_for_family(seed, deadline, Some(&stop), &family_limits)
+            else {
+                if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                    timed_out.fetch_add(1, Ordering::Relaxed);
+                } else if !stop.load(Ordering::Relaxed) {
+                    // Stopped by a limit: certain to break a layout condition.
+                    stage_rejects[family::STAGE_LAYOUT].fetch_add(1, Ordering::Relaxed);
+                }
+                return None;
+            };
+            let view = View {
+                plan: &plan,
+                layout: Some(LayoutFacts::from_summary(&summary)),
+                db,
+            };
+            if !fam.check(family::STAGE_LAYOUT, &view) {
+                stage_rejects[family::STAGE_LAYOUT].fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            return Some(Candidate {
+                seed: seed_to_hex(seed),
+                traits: TraitsWire::from(&traits),
+                stats: Some(render::stats_from(&plan, &summary)),
+            });
         }
         if angle_active && !angle_passes(linear_flow_angle_deg(seed, &traits), min_angle, max_angle) {
             return None;
@@ -1113,6 +1334,12 @@ where
     pool.scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|_| loop {
+                while PAUSED.load(Ordering::Relaxed)
+                    && !stop.load(Ordering::Relaxed)
+                    && !CANCEL.load(Ordering::Relaxed)
+                {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
                 if stop.load(Ordering::Relaxed) || CANCEL.load(Ordering::Relaxed) {
                     break;
                 }
@@ -1136,6 +1363,14 @@ where
                 if let Some(c) = hit {
                     let mut found = results.lock().unwrap();
                     if found.len() < want {
+                        if let Some(log) = hits_log.as_ref() {
+                            use std::io::Write;
+                            let at = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let _ = writeln!(log.lock().unwrap(), "0x{},{at}", c.seed);
+                        }
                         pending_found.lock().unwrap().push(c.clone());
                         found.push(c);
                         found_atomic.store(found.len(), Ordering::Relaxed);
@@ -1165,6 +1400,10 @@ where
         want,
         timed_out,
         new_candidates: std::mem::take(&mut *pending_found.lock().unwrap()),
+        stage_rejects: family::load_stage_counters(&stage_rejects),
+        layout_runs: layout_runs.load(Ordering::Relaxed),
+        elapsed_ms: 0,
+        paused: false,
     });
 
     Ok(GenerateOutcome {
@@ -1545,6 +1784,8 @@ mod tests {
             min_center_y: None,
             max_center_y: None,
             layout_timeout_ms: None,
+            family: None,
+            hits_log: None,
         };
         let outcome = generate_candidates_inner(req, |_| {}).unwrap();
         assert_eq!(outcome.candidates.len(), 4);
@@ -1581,6 +1822,8 @@ mod tests {
             min_center_y: Some(2.0 / 6.0),
             max_center_y: Some(4.0 / 6.0),
             layout_timeout_ms: None,
+            family: None,
+            hits_log: None,
         };
         let outcome = generate_candidates_inner(req, |_| {}).unwrap();
         assert_eq!(outcome.candidates.len(), 6);
@@ -1661,7 +1904,60 @@ mod tests {
             min_center_y: None,
             max_center_y: None,
             layout_timeout_ms: None,
+            family: None,
+            hits_log: None,
         }
+    }
+
+    /// Find family: hits satisfy every condition, carry stats with
+    /// family values, and rejected seeds are counted per stage.
+    #[test]
+    fn family_search_finds_matching_seeds() {
+        let mut choices = TraitChoices::default();
+        choices.structure = Some("Formation".into());
+        choices.flow_field = Some("Spiral".into());
+        let family = vec![
+            FamilyConstraint::Equals { key: "flowRotation".into(), value: "ccw".into() },
+            FamilyConstraint::Range { key: "turbCount".into(), min: 0.0, max: 1000.0 },
+            FamilyConstraint::Range { key: "points".into(), min: 0.0, max: 100_000.0 },
+        ];
+        let req = GenerateRequest {
+            address: "0x33c9371d25ce44a408f8a6473fbad86bf81e1a17".into(),
+            choices,
+            mode: GenerateMode::Construct,
+            count: 3,
+            max_attempts: None,
+            run_layout: false,
+            characteristic_filter: None,
+            rng_seed: Some(5),
+            workers: Some(4),
+            min_angle_deg: None,
+            max_angle_deg: None,
+            min_center_x: None,
+            max_center_x: None,
+            min_center_y: None,
+            max_center_y: None,
+            layout_timeout_ms: None,
+            family: Some(family),
+            hits_log: None,
+        };
+        let last = Arc::new(Mutex::new(None::<GenerateProgress>));
+        let last_c = last.clone();
+        let out = generate_candidates_inner(req, move |p| {
+            *last_c.lock().unwrap() = Some(p);
+        })
+        .unwrap();
+        assert_eq!(out.candidates.len(), 3);
+        for c in &out.candidates {
+            let st = c.stats.as_ref().expect("family hits carry stats");
+            assert_eq!(st.family.texts.get("flowRotation").map(String::as_str), Some("ccw"));
+            assert!(st.family.nums.contains_key("points"));
+        }
+        let p = last.lock().unwrap().take().unwrap();
+        assert_eq!(p.stage_rejects.len(), family::NUM_STAGES);
+        // Roughly half the seeds turn clockwise and are dropped at the flow stage.
+        assert!(p.stage_rejects[family::STAGE_FLOW] > 0, "{:?}", p.stage_rejects);
+        assert!(p.layout_runs >= 3);
     }
 
     #[test]
@@ -1770,6 +2066,8 @@ mod tests {
             min_center_y: None,
             max_center_y: None,
             layout_timeout_ms: None,
+            family: None,
+            hits_log: None,
         };
         let outcome = generate_candidates_inner(req, |_| {}).unwrap();
         assert_eq!(outcome.candidates.len(), 30);
@@ -1880,6 +2178,8 @@ mod tests {
             max_center_y: None,
             // 1 ms: every dense layout times out.
             layout_timeout_ms: Some(1),
+            family: None,
+            hits_log: None,
         };
         let outcome = generate_candidates_inner(req, |_| {}).unwrap();
         assert!(outcome.timed_out > 0, "expected timeouts");
@@ -1909,6 +2209,8 @@ mod tests {
             min_center_y: None,
             max_center_y: None,
             layout_timeout_ms: None,
+            family: None,
+            hits_log: None,
         };
         let result = generate_candidates_inner(req, move |_| {
             counter.fetch_add(1, Ordering::Relaxed);
@@ -1971,6 +2273,8 @@ mod tests {
             min_center_y: None,
             max_center_y: None,
             layout_timeout_ms: None,
+            family: None,
+            hits_log: None,
         };
         let outcome = generate_candidates_inner(req, |_| {}).unwrap();
         assert_eq!(outcome.candidates.len(), 12);
@@ -2012,6 +2316,8 @@ mod tests {
             min_center_y: None,
             max_center_y: None,
             layout_timeout_ms: None,
+            family: None,
+            hits_log: None,
         };
         let outcome = generate_candidates_inner(req, move |p| {
             sink.lock().unwrap().extend(p.new_candidates.into_iter().map(|c| c.seed));

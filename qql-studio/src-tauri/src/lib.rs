@@ -1,4 +1,5 @@
 mod commands;
+mod family;
 mod render;
 mod seed;
 
@@ -29,6 +30,10 @@ pub fn run() {
             commands::session_id,
             commands::list_favorites,
             commands::render_thumbnail,
+            commands::pause_search,
+            commands::family_hits_folder,
+            commands::system_info,
+            commands::estimate_family,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

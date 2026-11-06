@@ -5,6 +5,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use image::{ImageBuffer, ImageFormat, Rgba};
 use once_cell::sync::Lazy;
 use qql::{art, color::ColorDb, config::Config};
+use crate::family::{FamilyValues, LayoutFacts, View};
 use serde::Serialize;
 use std::io::Cursor;
 use std::time::Instant;
@@ -36,6 +37,34 @@ pub struct LayoutStats {
     pub splatter_odds: f64,
     /// Flow field set-up (linear angle, or radial circularity/direction/center).
     pub flow: FlowWire,
+    /// Share of circle area per size bucket, and the largest circle.
+    pub size_profile: SizeProfileWire,
+    /// Every Find-family property of the piece (see `family.rs`).
+    pub family: FamilyValues,
+}
+
+/// Share of drawn circle *area* per size bucket, plus the largest circle.
+/// Closer to what the eye sees than counts: one large circle covers as much as
+/// hundreds of small ones.
+#[derive(Serialize, Clone, Debug, Copy, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SizeProfileWire {
+    pub area_small_pct: f64,
+    pub area_medium_pct: f64,
+    pub area_large_pct: f64,
+    /// Largest circle radius, percent of canvas width.
+    pub max_radius_pct: f64,
+}
+
+impl From<art::SizeProfile> for SizeProfileWire {
+    fn from(p: art::SizeProfile) -> Self {
+        Self {
+            area_small_pct: p.area_small * 100.0,
+            area_medium_pct: p.area_medium * 100.0,
+            area_large_pct: p.area_large * 100.0,
+            max_radius_pct: p.max_radius * 100.0,
+        }
+    }
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -240,7 +269,32 @@ impl From<art::RadiusBuckets> for RadiusBucketsWire {
 pub fn layout_only(seed: &[u8; 32]) -> LayoutStats {
     let cfg = Config::default();
     let summary = art::layout(seed, color_db(), &cfg);
-    summary_to_stats(&summary)
+    summary_to_stats(seed, &summary)
+}
+
+/// Layout for the Find-family search: stops early (returning `None`) at the
+/// deadline, on `cancel`, or as soon as the piece is certain to break one of
+/// `limits`. Returns the summary (for checking conditions) and its stats.
+pub fn layout_for_family(
+    seed: &[u8; 32],
+    deadline: Option<Instant>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    limits: &art::LayoutLimits,
+) -> Option<art::LayoutSummary> {
+    let cfg = Config::default();
+    art::layout_with_layout_limits(seed, color_db(), &cfg, deadline, cancel, limits)
+}
+
+/// Stats for a seed whose plan and layout are already known.
+pub fn stats_from(plan: &art::Plan, summary: &art::LayoutSummary) -> LayoutStats {
+    let mut stats = summary_stats_base(summary);
+    stats.family = View {
+        plan,
+        layout: Some(LayoutFacts::from_summary(summary)),
+        db: color_db(),
+    }
+    .values();
+    stats
 }
 
 /// Like [`layout_only`] but returns `None` when the layout takes longer than
@@ -257,7 +311,7 @@ pub fn layout_only_with_limits(
     let cfg = Config::default();
     let summary =
         art::layout_with_limits(seed, color_db(), &cfg, deadline, max_points, cancel)?;
-    Some(summary_to_stats(&summary))
+    Some(summary_to_stats(seed, &summary))
 }
 
 /// The subset of [`LayoutStats`] that's fixed before any dots are placed.
@@ -307,7 +361,13 @@ fn color_name(key: qql::color::ColorKey) -> String {
         .unwrap_or_else(|| format!("color#{}", key))
 }
 
-fn summary_to_stats(summary: &art::LayoutSummary) -> LayoutStats {
+fn summary_to_stats(seed: &[u8; 32], summary: &art::LayoutSummary) -> LayoutStats {
+    let plan = art::plan(seed, color_db());
+    stats_from(&plan, summary)
+}
+
+/// Stats without the family values (filled in by the callers).
+fn summary_stats_base(summary: &art::LayoutSummary) -> LayoutStats {
     let colors_used = summary
         .colors_used
         .iter()
@@ -340,6 +400,8 @@ fn summary_to_stats(summary: &art::LayoutSummary) -> LayoutStats {
         curve_length: summary.curve_length,
         splatter_odds: summary.splatter_odds,
         flow: summary.flow.into(),
+        size_profile: summary.size_profile.into(),
+        family: FamilyValues::default(),
     }
 }
 
@@ -396,6 +458,13 @@ pub fn render(seed: &[u8; 32], width: i32, inflate: bool) -> Result<RenderResult
             curve_length: render_data.curve_length,
             splatter_odds: render_data.splatter_odds,
             flow: render_data.flow.into(),
+            size_profile: render_data.size_profile.into(),
+            family: View {
+                plan: &art::plan(seed, color_db()),
+                layout: Some(LayoutFacts::from_render(&render_data)),
+                db: color_db(),
+            }
+            .values(),
         },
     })
 }
