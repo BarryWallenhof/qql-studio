@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::color::ColorKey;
 
-#[derive(Default, PartialEq)]
+#[derive(Default, PartialEq, Clone)]
 pub struct ColorsUsed {
     vector: Vec<ColorKey>,
     set: HashSet<ColorKey>,

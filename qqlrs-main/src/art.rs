@@ -6,9 +6,7 @@ use raqote::{DrawOptions, DrawTarget, PathBuilder, SolidSource, Source, StrokeSt
 
 use super::color::{ColorDb, ColorKey, ColorSpec};
 use super::config::{Animation, Config, FractionalViewport};
-use super::layouts::{
-    FormationDims, OrbitalInfo, ShadowsInfo, StartPointGroups, StructureInfo,
-};
+use super::layouts::{FormationDims, OrbitalInfo, ShadowsInfo, StartPointGroups, StructureParams};
 use super::math::{angle, cos, dist, modulo, pi, rescale, sin};
 use super::rand::Rng;
 use super::sectors::{Collider, Sectors};
@@ -697,6 +695,15 @@ struct Disturbance {
 
 impl Disturbance {
     fn build(traits: &Traits, rng: &mut Rng) -> Vec<Self> {
+        Self::build_with_info(traits, rng).0
+    }
+
+    /// Like [`build`], but also returns the turbulence strength: the standard
+    /// deviation (in radians) used for each disturbance's angle.
+    ///
+    /// LOCAL MODIFICATION (QQL Studio): surfaced for filtering. RNG usage is
+    /// identical to the original `build`.
+    fn build_with_info(traits: &Traits, rng: &mut Rng) -> (Vec<Self>, f64) {
         let num: usize = match traits.turbulence {
             Turbulence::None => 0,
             Turbulence::Low => *rng.wc(&[(10, 2), (15, 3), (20, 2), (30, 1)]),
@@ -719,7 +726,7 @@ impl Disturbance {
                 radius,
             })
         }
-        disturbances
+        (disturbances, theta_variance)
     }
 }
 
@@ -859,7 +866,10 @@ struct TrigCache(Vec<(f64, f64)>);
 
 impl TrigCache {
     fn new() -> Self {
-        TrigCache(vec![(f64::NAN, f64::NAN); FLOW_FIELD_COLS * FLOW_FIELD_ROWS])
+        TrigCache(vec![
+            (f64::NAN, f64::NAN);
+            FLOW_FIELD_COLS * FLOW_FIELD_ROWS
+        ])
     }
 
     #[inline]
@@ -995,6 +1005,70 @@ impl Point {
     }
 }
 
+/// Upper bounds that let a layout stop as soon as its outcome is certain to
+/// fail a filter, instead of placing every remaining point.
+///
+/// LOCAL MODIFICATION (QQL Studio). Only maxima can work this way: points are
+/// only ever added, so once a count or size is over its maximum it stays over.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LayoutLimits {
+    /// Most points allowed (all placed points, as in `LayoutSummary::num_points`).
+    pub max_points: Option<usize>,
+    /// Most drawn circles allowed per radius bucket (see [`RadiusBuckets`]).
+    pub max_small: Option<usize>,
+    pub max_medium: Option<usize>,
+    pub max_large: Option<usize>,
+    /// Largest drawn radius allowed, in virtual canvas units.
+    pub max_radius: Option<f64>,
+}
+
+impl LayoutLimits {
+    pub fn is_empty(&self) -> bool {
+        *self == LayoutLimits::default()
+    }
+}
+
+/// Running counts for [`LayoutLimits`] while points are placed.
+#[derive(Debug, Default)]
+struct LimitTracker {
+    small: usize,
+    medium: usize,
+    large: usize,
+}
+
+impl LimitTracker {
+    /// Record a point just placed with radius `scale` (the point count is now
+    /// `num_points`) and report whether any limit is now exceeded.
+    fn exceeds(&mut self, limits: &LayoutLimits, num_points: usize, scale: f64) -> bool {
+        if let Some(m) = limits.max_points {
+            if num_points > m {
+                return true;
+            }
+        }
+        // Non-positive radii are placed but never drawn; the size buckets and
+        // the largest-circle measure ignore them too.
+        if scale <= 0.0 {
+            return false;
+        }
+        if let Some(r) = limits.max_radius {
+            if scale > r {
+                return true;
+            }
+        }
+        let (count, max) = if scale <= RADIUS_BUCKET_SMALL_MAX {
+            self.small += 1;
+            (self.small, limits.max_small)
+        } else if scale <= RADIUS_BUCKET_MEDIUM_MAX {
+            self.medium += 1;
+            (self.medium, limits.max_medium)
+        } else {
+            self.large += 1;
+            (self.large, limits.max_large)
+        };
+        matches!(max, Some(m) if count > m)
+    }
+}
+
 impl Points {
     #[allow(clippy::too_many_arguments)]
     pub fn build(
@@ -1025,8 +1099,9 @@ impl Points {
             None,
             None,
             None,
+            &LayoutLimits::default(),
         )
-        .expect("no deadline, point cap or cancel => never aborts")
+        .expect("no deadline, point cap, cancel or limits => never aborts")
     }
 
     /// Like [`build`], but if `deadline` is `Some`, periodically checks the
@@ -1035,6 +1110,11 @@ impl Points {
     /// as soon as more than `max_points` points have been placed, for filters
     /// that only need to know the piece is over a point budget, and when
     /// `cancel` (if given) becomes true.
+    ///
+    /// LOCAL MODIFICATION (Find family): also returns `None` as soon as the piece
+    /// is certain to exceed one of `limits` (more circles of a size than
+    /// allowed, or a circle bigger than allowed). With default (empty) limits
+    /// the behavior is unchanged.
     #[allow(clippy::too_many_arguments)]
     pub fn build_with_deadline(
         traits: &Traits,
@@ -1051,6 +1131,7 @@ impl Points {
         deadline: Option<Instant>,
         max_points: Option<usize>,
         cancel: Option<&AtomicBool>,
+        limits: &LayoutLimits,
     ) -> Option<(Points, GroupSizes)> {
         fn random_idx(len: usize, rng: &mut Rng) -> usize {
             rng.uniform(0.0, len as f64) as usize
@@ -1065,6 +1146,7 @@ impl Points {
         let GroupedFlowLines { groups, mut tracer } = grouped_flow_lines;
         let mut line_buf = Vec::with_capacity(tracer.curve_length);
         let mut group_sizes = Vec::with_capacity(groups.len());
+        let mut tracker = LimitTracker::default();
         let dump_points = std::env::var("QQL_DUMP_POINTS").is_ok();
         for (group_idx, group) in groups.into_iter().enumerate() {
             if stop_requested(deadline, cancel) {
@@ -1099,6 +1181,8 @@ impl Points {
                 deadline,
                 max_points,
                 cancel,
+                limits,
+                &mut tracker,
             );
             if aborted {
                 return None;
@@ -1123,7 +1207,8 @@ impl Points {
     }
 
     /// Returns `true` if the build was aborted because the deadline expired,
-    /// more than `max_points` points were placed, or `cancel` was set.
+    /// more than `max_points` points were placed, `cancel` was set, or a
+    /// limit was exceeded.
     #[allow(clippy::too_many_arguments)]
     fn build_group(
         dest: &mut Vec<Point>,
@@ -1146,6 +1231,8 @@ impl Points {
         deadline: Option<Instant>,
         max_points: Option<usize>,
         cancel: Option<&AtomicBool>,
+        limits: &LayoutLimits,
+        tracker: &mut LimitTracker,
     ) -> bool {
         if rng.odds(color_change_odds.line) {
             scale_generator.change(rng);
@@ -1202,7 +1289,9 @@ impl Points {
                     secondary_color,
                     bullseye,
                 });
-                if max_points.is_some_and(|m| dest.len() > m) {
+                if max_points.is_some_and(|m| dest.len() > m)
+                    || tracker.exceeds(limits, dest.len(), scale)
+                {
                     return true;
                 }
             }
@@ -1939,6 +2028,14 @@ pub struct RenderData {
     pub colors_used: ColorsUsed,
     pub ring_counts_used: BTreeMap<RingCount, usize>,
     pub radius_buckets: RadiusBuckets,
+    pub size_profile: SizeProfile,
+    /// How much of each ninth of the canvas is covered by circles, in a 3×3
+    /// grid read row by row from the top left: 0.0 = empty, ~0.8 = packed.
+    /// LOCAL MODIFICATION (Find family).
+    pub density_grid: [f64; 9],
+    /// Ring colors only (no splatter colors), as [`LayoutSummary::colors_used`].
+    /// LOCAL MODIFICATION (Find family).
+    pub layout_colors_used: ColorsUsed,
     pub quadrant_counts: QuadrantCounts,
     pub background_color: ColorKey,
     pub formation_dims: Option<FormationDims>,
@@ -1981,7 +2078,14 @@ pub fn draw<F: FnMut(Frame)>(
         let _ = writeln!(
             s,
             "META vw={} vh={} lx={} ty={} spc={} cols={} rows={} step={}",
-            VIRTUAL_W, VIRTUAL_H, LX, TY, SPC, FLOW_FIELD_COLS, FLOW_FIELD_ROWS, w(0.002)
+            VIRTUAL_W,
+            VIRTUAL_H,
+            LX,
+            TY,
+            SPC,
+            FLOW_FIELD_COLS,
+            FLOW_FIELD_ROWS,
+            w(0.002)
         );
         for xi in 0..FLOW_FIELD_COLS {
             for yi in 0..FLOW_FIELD_ROWS {
@@ -2015,12 +2119,17 @@ pub fn draw<F: FnMut(Frame)>(
         &mut rng,
     );
     eprintln!("laid out points");
+    // LOCAL MODIFICATION (Find family): the ring colors, before painting adds
+    // splatter colors, to match what a layout-only pass reports.
+    let layout_colors_used = colors_used.clone();
     let num_points = points.0.len();
     let mut ring_counts_used = BTreeMap::new();
     for pt in &points.0 {
         *ring_counts_used.entry(pt.num_drawn_rings()).or_default() += 1;
     }
     let radius_buckets_summary = radius_buckets(&points.0);
+    let size_profile_summary = size_profile(&points.0);
+    let density_grid_summary = density_grid(&points.0);
     let quadrant_counts_summary = quadrant_counts(&points.0);
 
     let () = adjust_draw_radius(config, points.0.as_mut_slice());
@@ -2258,6 +2367,9 @@ pub fn draw<F: FnMut(Frame)>(
         colors_used,
         ring_counts_used,
         radius_buckets: radius_buckets_summary,
+        size_profile: size_profile_summary,
+        density_grid: density_grid_summary,
+        layout_colors_used,
         quadrant_counts: quadrant_counts_summary,
         background_color,
         formation_dims: formation_dims_summary,
@@ -2370,7 +2482,12 @@ impl FlowInfo {
                 ccw: None,
                 center_frac,
             },
-            FlowFieldSpec::Radial { circularity, direction, rotation, default_theta } => FlowInfo {
+            FlowFieldSpec::Radial {
+                circularity,
+                direction,
+                rotation,
+                default_theta,
+            } => FlowInfo {
                 linear: false,
                 default_theta,
                 circularity: Some(circularity),
@@ -2388,6 +2505,11 @@ pub struct LayoutSummary {
     pub colors_used: ColorsUsed,
     pub ring_counts_used: BTreeMap<RingCount, usize>,
     pub radius_buckets: RadiusBuckets,
+    pub size_profile: SizeProfile,
+    /// How much of each ninth of the canvas is covered by circles, in a 3×3
+    /// grid read row by row from the top left: 0.0 = empty, ~0.8 = packed.
+    /// LOCAL MODIFICATION (Find family).
+    pub density_grid: [f64; 9],
     pub quadrant_counts: QuadrantCounts,
     pub background_color: ColorKey,
     /// For Formation pieces only: the `(H, V)` grid the algorithm chose.
@@ -2466,6 +2588,87 @@ pub const RADIUS_BUCKET_SMALL_MAX: f64 = VIRTUAL_W * 0.012;
 /// Boundary between medium and large points on the virtual canvas.
 pub const RADIUS_BUCKET_MEDIUM_MAX: f64 = VIRTUAL_W * 0.030;
 
+/// How the drawn circle *area* (not count) is split over the size buckets,
+/// plus the largest radius. Area is what the eye sees: one large circle covers
+/// as much as hundreds of small ones.
+///
+/// LOCAL MODIFICATION (QQL Studio).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SizeProfile {
+    /// Share of total circle area (sum of radius²) in each bucket, 0–1.
+    pub area_small: f64,
+    pub area_medium: f64,
+    pub area_large: f64,
+    /// Largest drawn radius, as a fraction of canvas width.
+    pub max_radius: f64,
+}
+
+/// Circle coverage per cell of a 3×3 grid over the visible canvas (see
+/// [`LayoutSummary::density_grid`]). Each circle's area is shared among the
+/// cells its bounding box overlaps, in proportion to the overlap, so a large
+/// circle on a cell border counts toward both cells.
+fn density_grid(points: &[Point]) -> [f64; 9] {
+    let cell_w = VIRTUAL_W / 3.0;
+    let cell_h = VIRTUAL_H / 3.0;
+    let mut area = [0.0f64; 9];
+    for pt in points {
+        let r = pt.scale;
+        if r <= 0.0 {
+            continue;
+        }
+        let (x, y) = pt.position;
+        let (x0, x1) = ((x - r).max(0.0), (x + r).min(VIRTUAL_W));
+        let (y0, y1) = ((y - r).max(0.0), (y + r).min(VIRTUAL_H));
+        if x0 >= x1 || y0 >= y1 {
+            continue;
+        }
+        let circle = std::f64::consts::PI * r * r;
+        let bbox = 4.0 * r * r;
+        for row in 0..3 {
+            let (cy0, cy1) = (row as f64 * cell_h, (row + 1) as f64 * cell_h);
+            let oy = (y1.min(cy1) - y0.max(cy0)).max(0.0);
+            if oy == 0.0 {
+                continue;
+            }
+            for col in 0..3 {
+                let (cx0, cx1) = (col as f64 * cell_w, (col + 1) as f64 * cell_w);
+                let ox = (x1.min(cx1) - x0.max(cx0)).max(0.0);
+                area[row * 3 + col] += circle * (ox * oy) / bbox;
+            }
+        }
+    }
+    let cell_area = cell_w * cell_h;
+    area.map(|a| a / cell_area)
+}
+
+fn size_profile(points: &[Point]) -> SizeProfile {
+    let (mut s, mut m, mut l, mut max) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for pt in points {
+        if pt.scale <= 0.0 {
+            continue;
+        }
+        let a = pt.scale * pt.scale;
+        if pt.scale <= RADIUS_BUCKET_SMALL_MAX {
+            s += a;
+        } else if pt.scale <= RADIUS_BUCKET_MEDIUM_MAX {
+            m += a;
+        } else {
+            l += a;
+        }
+        max = max.max(pt.scale);
+    }
+    let total = s + m + l;
+    if total <= 0.0 {
+        return SizeProfile::default();
+    }
+    SizeProfile {
+        area_small: s / total,
+        area_medium: m / total,
+        area_large: l / total,
+        max_radius: max / VIRTUAL_W,
+    }
+}
+
 fn radius_buckets(points: &[Point]) -> RadiusBuckets {
     let mut b = RadiusBuckets::default();
     for pt in points {
@@ -2487,8 +2690,7 @@ fn radius_buckets(points: &[Point]) -> RadiusBuckets {
 /// (traits, point count, colors used, ring-count histogram). Skips rasterization,
 /// so this is much cheaper than [`draw`] and suitable for bulk filtering.
 pub fn layout(seed: &[u8; 32], color_db: &ColorDb, config: &Config) -> LayoutSummary {
-    layout_with_deadline(seed, color_db, config, None)
-        .expect("no deadline => never aborts")
+    layout_with_deadline(seed, color_db, config, None).expect("no deadline => never aborts")
 }
 
 /// Like [`layout_with_deadline`], but also returns `None` as soon as more
@@ -2507,7 +2709,15 @@ pub fn layout_with_limits(
     max_points: Option<usize>,
     cancel: Option<&AtomicBool>,
 ) -> Option<LayoutSummary> {
-    layout_impl(seed, color_db, config, deadline, max_points, cancel)
+    layout_impl(
+        seed,
+        color_db,
+        config,
+        deadline,
+        max_points,
+        cancel,
+        &LayoutLimits::default(),
+    )
 }
 
 /// Like [`layout`] but bails out and returns `None` if `deadline` has passed
@@ -2519,7 +2729,31 @@ pub fn layout_with_deadline(
     config: &Config,
     deadline: Option<Instant>,
 ) -> Option<LayoutSummary> {
-    layout_impl(seed, color_db, config, deadline, None, None)
+    layout_impl(
+        seed,
+        color_db,
+        config,
+        deadline,
+        None,
+        None,
+        &LayoutLimits::default(),
+    )
+}
+
+/// Like [`layout_with_limits`], but also gives up (returning `None`) as soon
+/// as the piece is certain to exceed one of `limits`.
+///
+/// LOCAL MODIFICATION (Find family).
+pub fn layout_with_layout_limits(
+    seed: &[u8; 32],
+    color_db: &ColorDb,
+    config: &Config,
+    deadline: Option<Instant>,
+    cancel: Option<&AtomicBool>,
+    limits: &LayoutLimits,
+) -> Option<LayoutSummary> {
+    let max_points = limits.max_points;
+    layout_impl(seed, color_db, config, deadline, max_points, cancel, limits)
 }
 
 fn layout_impl(
@@ -2529,6 +2763,7 @@ fn layout_impl(
     deadline: Option<Instant>,
     max_points: Option<usize>,
     cancel: Option<&AtomicBool>,
+    limits: &LayoutLimits,
 ) -> Option<LayoutSummary> {
     let traits = Traits::from_seed(seed);
     let mut rng = Rng::from_seed(&seed[..]);
@@ -2568,6 +2803,7 @@ fn layout_impl(
         deadline,
         max_points,
         cancel,
+        limits,
     )?;
     let num_points = points.0.len();
     let mut ring_counts_used = BTreeMap::new();
@@ -2575,6 +2811,8 @@ fn layout_impl(
         *ring_counts_used.entry(pt.num_drawn_rings()).or_default() += 1;
     }
     let radius_buckets = radius_buckets(&points.0);
+    let size_profile = size_profile(&points.0);
+    let density_grid = density_grid(&points.0);
     let quadrant_counts = quadrant_counts(&points.0);
     let background_color = color_scheme.background;
     let splatter_odds = color_scheme.splatter_odds;
@@ -2585,6 +2823,8 @@ fn layout_impl(
         colors_used,
         ring_counts_used,
         radius_buckets,
+        size_profile,
+        density_grid,
         quadrant_counts,
         background_color,
         formation_dims,
@@ -2596,9 +2836,384 @@ fn layout_impl(
     })
 }
 
+/// Everything the algorithm decides *before* it starts placing points.
+///
+/// LOCAL MODIFICATION (QQL Studio): placing points (collision testing along
+/// every flow line) is by far the most expensive part of a layout. All of the
+/// values below are fixed before that step, so a seed can be accepted or
+/// rejected on them for a tiny fraction of the cost of [`layout`].
+#[derive(Debug, Clone)]
+pub struct Plan {
+    pub traits: Traits,
+    pub flow_field_spec: FlowFieldSpec,
+    /// Center of a radial flow field as fractions of canvas width and height.
+    /// `None` for linear flow fields.
+    pub radial_center: Option<(f64, f64)>,
+    /// Number of turbulence disturbances added to the flow field.
+    pub num_disturbances: usize,
+    /// Standard deviation of each disturbance's angle, in radians.
+    pub turbulence_theta: f64,
+    pub spacing_spec: SpacingSpec,
+    pub color_change_odds: ColorChangeOdds,
+    /// Starting mean circle radius, as a fraction of canvas width.
+    pub scale_start: f64,
+    /// Number of colors in the primary / secondary color sequences.
+    pub num_primary_colors: usize,
+    pub num_secondary_colors: usize,
+    pub background_color: ColorKey,
+    pub splatter_odds: f64,
+    /// Probability that a flow line group ignores the flow field.
+    pub ignore_flow_field_odds: f64,
+    pub formation_dims: Option<FormationDims>,
+    pub orbital_info: Option<OrbitalInfo>,
+    pub shadows_info: Option<ShadowsInfo>,
+    pub curve_length: usize,
+    /// The palette colors the primary / secondary sequences keep, in order.
+    pub primary_seq: Vec<ColorKey>,
+    pub secondary_seq: Vec<ColorKey>,
+    /// Colors splatter dots can take (may repeat; one is picked per dot).
+    pub splatter_colors: Vec<ColorKey>,
+    /// Where splatter is most likely, as fractions of canvas width / height.
+    pub splatter_center: (f64, f64),
+    /// Mean ring fill density of the circles (0.17 = thick bands with gaps,
+    /// 0.93 = nearly solid).
+    pub ring_density: f64,
+    /// The strongest turbulence disturbances, strongest first (at most 3):
+    /// `(x, y, strength)` with x/y as canvas fractions and strength as
+    /// |angle| (degrees) times radius (canvas widths).
+    pub top_spots: Vec<(f64, f64, f64)>,
+    /// Colors of the first group of flow lines: `(primary, secondary)`.
+    /// `None` until [`PlanStage::StartColors`].
+    pub start_colors: Option<(ColorKey, ColorKey)>,
+}
+
+/// Checkpoints in [`plan_staged`], in the order the algorithm reaches them.
+///
+/// LOCAL MODIFICATION (QQL Studio).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanStage {
+    /// Flow field, turbulence, color scheme and starting scale are known. The
+    /// structure fields of the plan are still `None`.
+    PreStructure,
+    /// Structure parameters are known (Formation grid and spacing, Orbital
+    /// center and band size, Shadows target and fill). Values that only exist
+    /// once the geometry is built (ring bands, chunks or circles placed) are
+    /// still zero, and `curve_length` is still 0.
+    StructureParams,
+    /// Structure geometry and curve length are known.
+    Complete,
+    /// The first line group's colors are known (`start_colors`). This is
+    /// the last value drawn before point placement starts.
+    StartColors,
+}
+
+/// Run the algorithm up to (but not including) point placement and return the
+/// decisions made so far. Consumes entropy in exactly the same order as
+/// [`layout`] and [`draw`], so every value matches what those would produce for
+/// the same seed. Skips building the flow field grid and the flow lines, which
+/// do not consume entropy.
+pub fn plan(seed: &[u8; 32], color_db: &ColorDb) -> Plan {
+    plan_staged(seed, color_db, |_, _| true).expect("check always passes")
+}
+
+/// Like [`plan`], but calls `check` at each [`PlanStage`] and stops as soon as
+/// it returns `false`. Lets a search reject a seed on its flow field before
+/// paying for the structure geometry (which, for Orbital pieces, is the bulk
+/// of the planning cost).
+pub fn plan_staged<F>(seed: &[u8; 32], color_db: &ColorDb, mut check: F) -> Option<Plan>
+where
+    F: FnMut(PlanStage, &Plan) -> bool,
+{
+    let traits = Traits::from_seed(seed);
+    let mut rng = Rng::from_seed(&seed[..]);
+
+    let flow_field_spec = FlowFieldSpec::from_traits(&traits, &mut rng);
+    let spacing_spec = SpacingSpec::from_traits(&traits, &mut rng);
+    let color_change_odds = ColorChangeOdds::from_traits(&traits, &mut rng);
+    let scale_generator = ScaleGenerator::from_traits(&traits, &mut rng);
+    let bullseye_generator = BullseyeGenerator::from_traits(&traits, &mut rng);
+    let color_scheme = ColorScheme::from_traits(&traits, color_db, &mut rng);
+
+    // Mirror `FlowField::build`: a radial field draws its center first, then
+    // the turbulence disturbances are drawn. Neither the grid nor `adjust`
+    // consume entropy, so they are skipped here.
+    let radial_center = match flow_field_spec {
+        FlowFieldSpec::Linear { .. } => None,
+        FlowFieldSpec::Radial { .. } => {
+            let (cx, cy) = FlowField::pick_center(traits.version, &mut rng);
+            Some((cx / VIRTUAL_W, cy / VIRTUAL_H))
+        }
+    };
+    let (disturbances, turbulence_theta) = Disturbance::build_with_info(&traits, &mut rng);
+    let mut top_spots: Vec<(f64, f64, f64)> = disturbances
+        .iter()
+        .map(|d| {
+            (
+                d.center.0 / VIRTUAL_W,
+                d.center.1 / VIRTUAL_H,
+                d.theta.abs().to_degrees() * d.radius / VIRTUAL_W,
+            )
+        })
+        .collect();
+    top_spots.sort_by(|a, b| b.2.total_cmp(&a.2));
+    top_spots.truncate(3);
+    let ignore_flow_field = IgnoreFlowField::build(&flow_field_spec, &mut rng);
+
+    let scale_start = match scale_generator {
+        ScaleGenerator::Constant { mean } => mean,
+        ScaleGenerator::Variable { mean, .. } => mean,
+        ScaleGenerator::Wild { mean, .. } => mean,
+    } / VIRTUAL_W;
+
+    let mut plan = Plan {
+        traits,
+        flow_field_spec,
+        radial_center,
+        num_disturbances: disturbances.len(),
+        turbulence_theta,
+        spacing_spec,
+        color_change_odds,
+        scale_start,
+        num_primary_colors: color_scheme.primary_seq.len(),
+        num_secondary_colors: color_scheme.secondary_seq.len(),
+        background_color: color_scheme.background,
+        splatter_odds: color_scheme.splatter_odds,
+        ignore_flow_field_odds: ignore_flow_field.odds,
+        formation_dims: None,
+        orbital_info: None,
+        shadows_info: None,
+        curve_length: 0,
+        primary_seq: color_scheme.primary_seq.clone(),
+        secondary_seq: color_scheme.secondary_seq.clone(),
+        splatter_colors: color_scheme.splatter_choices.clone(),
+        splatter_center: (
+            color_scheme.splatter_center.0 / VIRTUAL_W,
+            color_scheme.splatter_center.1 / VIRTUAL_H,
+        ),
+        ring_density: bullseye_generator.density_mean,
+        top_spots,
+        start_colors: None,
+    };
+    if !check(PlanStage::PreStructure, &plan) {
+        return None;
+    }
+
+    let structure_params = StructureParams::draw(plan.traits.structure, &mut rng);
+    let partial = structure_params.partial_info();
+    plan.formation_dims = partial.formation;
+    plan.orbital_info = partial.orbital;
+    plan.shadows_info = partial.shadows;
+    if !check(PlanStage::StructureParams, &plan) {
+        return None;
+    }
+
+    let (start_points, structure_info) =
+        StartPointGroups::build_from_params(structure_params, &mut rng);
+    plan.formation_dims = structure_info.formation;
+    plan.orbital_info = structure_info.orbital;
+    plan.shadows_info = structure_info.shadows;
+    // Same draw as the first line of `GroupedFlowLines::build_with_info`.
+    plan.curve_length = GroupedFlowLines::pick_curve_length(&mut rng);
+    if !check(PlanStage::Complete, &plan) {
+        return None;
+    }
+
+    // Mirror the rest of `GroupedFlowLines::build_with_info` (one `ignore`
+    // draw per group) and the start of `Points::build_with_deadline` (the
+    // starting color indices, the base bullseye and the first group's color
+    // change roll). Nothing here traces lines or places points.
+    let num_groups = start_points.0.len();
+    for _ in 0..num_groups {
+        let _ = rng.odds(ignore_flow_field.odds);
+    }
+    let seq_p = &color_scheme.primary_seq;
+    let seq_s = &color_scheme.secondary_seq;
+    let mut p_idx = rng.uniform(0.0, seq_p.len() as f64) as usize;
+    let mut s_idx = rng.uniform(0.0, seq_s.len() as f64) as usize;
+    let _ = bullseye_generator.next(&mut rng);
+    if num_groups > 0 {
+        if rng.odds(plan.color_change_odds.group) {
+            p_idx = pick_next_color(seq_p, p_idx, &mut rng);
+            s_idx = pick_next_color(seq_s, s_idx, &mut rng);
+        }
+        plan.start_colors = Some((seq_p[p_idx], seq_s[s_idx]));
+    }
+    if !check(PlanStage::StartColors, &plan) {
+        return None;
+    }
+    Some(plan)
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// The planning pass must agree with the full layout on every value both
+    /// of them report. If this fails, `plan` has drifted out of sync with the
+    /// entropy consumption of `layout`.
+    #[test]
+    fn plan_matches_layout() {
+        let color_db = ColorDb::from_bundle();
+        let config = Config::default();
+        let seeds: &[[u8; 32]] = &[
+            hex_literal::hex!("33c9371d25ce44a408f8a6473fbad86bf81e1a17a2e52c90cf66ffff1296712e"),
+            hex_literal::hex!("4c61496e282ba45975b6863f14aeed35d686abfe78273b39ee44ffff146a6246"),
+            hex_literal::hex!("b788f929c27e0a6e9abfc2a66ad878d73a930d128e1b0f08e009ffff10d10d4b"),
+            hex_literal::hex!("acfa3e822961cede6dabbbeef96838fec3ad3d471757c33c6737ffff14a14aaf"),
+            hex_literal::hex!("acfa3e822961cede6dabbbeef96838fec3ad3d474394b5163ebfffff1082ca03"),
+            hex_literal::hex!("039cd535c7d3bcb04e93ad44491b30185ee0a4c5674d1f6be3f2ffff12256335"),
+        ];
+        for seed in seeds {
+            let p = plan(seed, &color_db);
+            let l = layout(seed, &color_db, &config);
+            let tag = hex::encode(seed);
+            assert_eq!(p.traits, l.traits, "traits for {tag}");
+            assert_eq!(
+                p.background_color, l.background_color,
+                "background for {tag}"
+            );
+            assert_eq!(p.splatter_odds, l.splatter_odds, "splatter for {tag}");
+            assert_eq!(p.curve_length, l.curve_length, "curve length for {tag}");
+            assert_eq!(p.formation_dims, l.formation_dims, "formation for {tag}");
+            assert_eq!(p.orbital_info, l.orbital_info, "orbital for {tag}");
+            assert_eq!(p.shadows_info, l.shadows_info, "shadows for {tag}");
+            assert_eq!(p.radial_center, l.flow.center_frac, "flow center for {tag}");
+            // The first group's colors are always among the colors used.
+            let (sp, ss) = p.start_colors.expect("every test seed has line groups");
+            let used = l.colors_used.as_slice();
+            assert!(used.contains(&sp), "start primary for {tag}");
+            assert!(used.contains(&ss), "start secondary for {tag}");
+            let total: f64 = l.density_grid.iter().sum();
+            assert!(total > 0.0, "density grid for {tag}");
+        }
+    }
+
+    /// `start_colors` must replay the real first group's colors. Checked on
+    /// many pseudo-random seeds: the start pair is always among the colors
+    /// used, and when a piece uses exactly two colors they are the start pair.
+    #[test]
+    fn plan_start_colors_match_layout() {
+        let color_db = ColorDb::from_bundle();
+        let config = Config::default();
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut exact_checks = 0;
+        for _ in 0..60 {
+            let mut seed = [0u8; 32];
+            for b in seed.iter_mut() {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                *b = (state >> 56) as u8;
+            }
+            seed[26] = 0xff;
+            seed[27] = 0xff;
+            let p = plan(&seed, &color_db);
+            let l = layout(&seed, &color_db, &config);
+            let tag = hex::encode(seed);
+            let Some((sp, ss)) = p.start_colors else {
+                continue;
+            };
+            let used = l.colors_used.as_slice();
+            assert!(
+                used.contains(&sp) && used.contains(&ss),
+                "start colors for {tag}"
+            );
+            if used.len() == 2 && sp != ss {
+                exact_checks += 1;
+            }
+        }
+        eprintln!("two-color pieces checked exactly: {exact_checks}");
+    }
+
+    /// Limits must not change a layout that stays within them, and must stop
+    /// one that goes over.
+    #[test]
+    fn layout_limits_abort_only_when_exceeded() {
+        let color_db = ColorDb::from_bundle();
+        let config = Config::default();
+        let seed =
+            hex_literal::hex!("acfa3e822961cede6dabbbeef96838fec3ad3d471757c33c6737ffff14a14aaf");
+        let full = layout(&seed, &color_db, &config);
+        let loose = LayoutLimits {
+            max_points: Some(full.num_points),
+            max_small: Some(full.radius_buckets.small),
+            max_medium: Some(full.radius_buckets.medium),
+            max_large: Some(full.radius_buckets.large),
+            max_radius: Some(full.size_profile.max_radius * VIRTUAL_W + 1e-9),
+        };
+        let same = layout_with_layout_limits(&seed, &color_db, &config, None, None, &loose)
+            .expect("within limits must not abort");
+        assert_eq!(same.num_points, full.num_points);
+        assert_eq!(same.radius_buckets, full.radius_buckets);
+        let tight = LayoutLimits {
+            max_points: Some(full.num_points - 1),
+            ..LayoutLimits::default()
+        };
+        assert!(layout_with_layout_limits(&seed, &color_db, &config, None, None, &tight).is_none());
+        if full.radius_buckets.large > 0 {
+            let no_large = LayoutLimits {
+                max_large: Some(0),
+                ..LayoutLimits::default()
+            };
+            assert!(
+                layout_with_layout_limits(&seed, &color_db, &config, None, None, &no_large)
+                    .is_none()
+            );
+        }
+    }
+
+    /// Values visible at the StructureParams checkpoint must equal the final
+    /// ones, and a checkpoint that rejects must stop the plan.
+    #[test]
+    fn plan_staged_partial_values_are_final() {
+        let color_db = ColorDb::from_bundle();
+        let seeds: &[[u8; 32]] = &[
+            hex_literal::hex!("33c9371d25ce44a408f8a6473fbad86bf81e1a17a2e52c90cf66ffff1296712e"),
+            hex_literal::hex!("4c61496e282ba45975b6863f14aeed35d686abfe78273b39ee44ffff146a6246"),
+            hex_literal::hex!("b788f929c27e0a6e9abfc2a66ad878d73a930d128e1b0f08e009ffff10d10d4b"),
+            hex_literal::hex!("acfa3e822961cede6dabbbeef96838fec3ad3d471757c33c6737ffff14a14aaf"),
+            hex_literal::hex!("039cd535c7d3bcb04e93ad44491b30185ee0a4c5674d1f6be3f2ffff12256335"),
+        ];
+        for seed in seeds {
+            let full = plan(seed, &color_db);
+            let mut partial: Option<Plan> = None;
+            let stopped = plan_staged(seed, &color_db, |stage, p| {
+                if stage == PlanStage::StructureParams {
+                    partial = Some(p.clone());
+                    return false;
+                }
+                true
+            });
+            assert!(stopped.is_none(), "rejecting check must stop the plan");
+            let partial = partial.expect("reached StructureParams");
+            if let (Some(a), Some(b)) = (partial.formation_dims, full.formation_dims) {
+                assert_eq!(a.horizontal_sections, b.horizontal_sections);
+                assert_eq!(a.vertical_sections, b.vertical_sections);
+                assert_eq!(a.step_frac, b.step_frac);
+                assert_eq!(a.skip_odds, b.skip_odds);
+            }
+            if let (Some(a), Some(b)) = (partial.orbital_info, full.orbital_info) {
+                assert_eq!(a.center_x_frac, b.center_x_frac);
+                assert_eq!(a.center_y_frac, b.center_y_frac);
+                assert_eq!(a.base_step_frac, b.base_step_frac);
+                assert_eq!(a.radial_group_step_frac, b.radial_group_step_frac);
+                assert_eq!(a.split_offset_rad, b.split_offset_rad);
+                assert_eq!(a.center_on_canvas, b.center_on_canvas);
+            }
+            if let (Some(a), Some(b)) = (partial.shadows_info, full.shadows_info) {
+                assert_eq!(a.num_circles_target, b.num_circles_target);
+                assert_eq!(a.p_square, b.p_square);
+                assert_eq!(a.columnar_square, b.columnar_square);
+                assert_eq!(a.outward_radial, b.outward_radial);
+            }
+            assert_eq!(
+                partial.formation_dims.is_some(),
+                full.formation_dims.is_some()
+            );
+            assert_eq!(partial.orbital_info.is_some(), full.orbital_info.is_some());
+            assert_eq!(partial.shadows_info.is_some(), full.shadows_info.is_some());
+        }
+    }
 
     /// Tests that the hard-coded values for [`SPC`], [`FLOW_FIELD_ROWS`], and [`FLOW_FIELD_COLS`]
     /// match the computed values used (either implicitly or explicitly) in the JavaScript algorithm.

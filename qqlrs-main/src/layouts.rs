@@ -93,9 +93,24 @@ impl StartPointGroups {
         structure: Structure,
         rng: &mut Rng,
     ) -> (StartPointGroups, StructureInfo) {
-        match structure {
-            Structure::Orbital => {
-                let (groups, info) = orbital(rng);
+        let params = StructureParams::draw(structure, rng);
+        Self::build_from_params(params, rng)
+    }
+
+    /// Second half of [`build_with_info`]: build the geometry from parameters
+    /// already drawn with [`StructureParams::draw`].
+    ///
+    /// LOCAL MODIFICATION (QQL Studio): the structure functions used to draw
+    /// their parameters and build their geometry in one go. They are split so
+    /// a search can reject a seed on its parameters before paying for the
+    /// geometry. Entropy is consumed in exactly the original order.
+    pub fn build_from_params(
+        params: StructureParams,
+        rng: &mut Rng,
+    ) -> (StartPointGroups, StructureInfo) {
+        match params {
+            StructureParams::Orbital(p) => {
+                let (groups, info) = orbital(p, rng);
                 (
                     groups,
                     StructureInfo {
@@ -104,8 +119,8 @@ impl StartPointGroups {
                     },
                 )
             }
-            Structure::Shadows => {
-                let (groups, info) = shadows(rng);
+            StructureParams::Shadows(p) => {
+                let (groups, info) = shadows(p, rng);
                 (
                     groups,
                     StructureInfo {
@@ -114,8 +129,8 @@ impl StartPointGroups {
                     },
                 )
             }
-            Structure::Formation => {
-                let (groups, dims) = formation(rng);
+            StructureParams::Formation(p) => {
+                let (groups, dims) = formation(p, rng);
                 (
                     groups,
                     StructureInfo {
@@ -128,7 +143,99 @@ impl StartPointGroups {
     }
 }
 
-fn orbital(rng: &mut Rng) -> (StartPointGroups, OrbitalInfo) {
+/// Parameters an Orbital piece draws before building its rings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OrbitalParams {
+    pub base_step: f64,
+    pub radial_group_step: f64,
+    pub center_x: f64,
+    pub center_y: f64,
+    pub split_offset: f64,
+}
+
+/// Parameters a Shadows piece draws before placing its circles.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShadowsParams {
+    pub num_circles: usize,
+    pub p_square: f64,
+    pub columnar_square: bool,
+    pub outward_radial: bool,
+}
+
+/// Parameters a Formation piece draws before laying out its chunks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FormationParams {
+    pub step: f64,
+    pub num_horizontal_steps: usize,
+    pub num_vertical_steps: usize,
+    pub skip_odds: f64,
+}
+
+/// The parameters of a structure, drawn before its geometry is built.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum StructureParams {
+    Orbital(OrbitalParams),
+    Shadows(ShadowsParams),
+    Formation(FormationParams),
+}
+
+impl StructureParams {
+    pub fn draw(structure: Structure, rng: &mut Rng) -> Self {
+        match structure {
+            Structure::Orbital => StructureParams::Orbital(orbital_params(rng)),
+            Structure::Shadows => StructureParams::Shadows(shadows_params(rng)),
+            Structure::Formation => StructureParams::Formation(formation_params(rng)),
+        }
+    }
+
+    /// Structure info as far as it is known from the parameters alone. Values
+    /// that only exist after the geometry is built (ring bands, splits used,
+    /// chunks or circles actually placed) are left at zero / empty.
+    pub fn partial_info(&self) -> StructureInfo {
+        match *self {
+            StructureParams::Orbital(p) => StructureInfo {
+                orbital: Some(OrbitalInfo {
+                    ring_bands: 0,
+                    min_splits: 0,
+                    max_splits: 0,
+                    splits_used: [false; 3],
+                    center_on_canvas: p.center_x >= 0.0
+                        && p.center_x <= w(1.0)
+                        && p.center_y >= 0.0
+                        && p.center_y <= h(1.0),
+                    center_x_frac: p.center_x / w(1.0),
+                    center_y_frac: p.center_y / h(1.0),
+                    base_step_frac: p.base_step / w(1.0),
+                    radial_group_step_frac: p.radial_group_step / w(1.0),
+                    split_offset_rad: p.split_offset,
+                }),
+                ..StructureInfo::default()
+            },
+            StructureParams::Shadows(p) => StructureInfo {
+                shadows: Some(ShadowsInfo {
+                    num_circles_target: p.num_circles as u32,
+                    actual_circles: 0,
+                    p_square: p.p_square,
+                    columnar_square: p.columnar_square,
+                    outward_radial: p.outward_radial,
+                }),
+                ..StructureInfo::default()
+            },
+            StructureParams::Formation(p) => StructureInfo {
+                formation: Some(FormationDims {
+                    horizontal_sections: p.num_horizontal_steps,
+                    vertical_sections: p.num_vertical_steps,
+                    step_frac: p.step / w(1.0),
+                    skip_odds: p.skip_odds,
+                    actual_chunks: 0,
+                }),
+                ..StructureInfo::default()
+            },
+        }
+    }
+}
+
+fn orbital_params(rng: &mut Rng) -> OrbitalParams {
     let base_step = *rng.wc(&[
         (w(0.01), 3.0),
         (w(0.02), 2.0),
@@ -137,11 +244,8 @@ fn orbital(rng: &mut Rng) -> (StartPointGroups, OrbitalInfo) {
         (w(0.08), 1.0),
         (w(0.16), 0.5),
     ]);
-    let radial_step = base_step * 0.5;
-    let base_step_frac = base_step / w(1.0);
 
     let radial_group_step = *rng.wc(&[(w(0.07), 0.333), (w(0.15), 0.333), (w(0.3), 0.333)]);
-    let radial_group_step_frac = radial_group_step / w(1.0);
 
     let center_x = *rng.wc(&[
         (w(0.5), 0.3),
@@ -161,6 +265,29 @@ fn orbital(rng: &mut Rng) -> (StartPointGroups, OrbitalInfo) {
         (h(-1.6), 0.05),
         (h(1.6), 0.05),
     ]);
+    // Originally drawn just before the ring loop; nothing in between consumes
+    // entropy, so drawing it here keeps the sequence identical.
+    let split_offset = rng.uniform(0.0, pi(2.0));
+    OrbitalParams {
+        base_step,
+        radial_group_step,
+        center_x,
+        center_y,
+        split_offset,
+    }
+}
+
+fn orbital(p: OrbitalParams, rng: &mut Rng) -> (StartPointGroups, OrbitalInfo) {
+    let OrbitalParams {
+        base_step,
+        radial_group_step,
+        center_x,
+        center_y,
+        split_offset,
+    } = p;
+    let radial_step = base_step * 0.5;
+    let base_step_frac = base_step / w(1.0);
+    let radial_group_step_frac = radial_group_step / w(1.0);
     let center = (center_x, center_y);
     let center_x_frac = center_x / w(1.0);
     let center_y_frac = center_y / h(1.0);
@@ -177,7 +304,6 @@ fn orbital(rng: &mut Rng) -> (StartPointGroups, OrbitalInfo) {
             .max(dist((center_x, center_y), (w(1.0), 0.0)))
             .max(dist((center_x, center_y), (w(1.0), h(1.0))))
             .max(dist((center_x, center_y), (0.0, h(1.0))));
-    let split_offset = rng.uniform(0.0, pi(2.0));
 
     let mut groups = Vec::new();
     let mut group_radius = w(0.001);
@@ -257,17 +383,31 @@ fn orbital(rng: &mut Rng) -> (StartPointGroups, OrbitalInfo) {
     (StartPointGroups(groups), info)
 }
 
-fn shadows(rng: &mut Rng) -> (StartPointGroups, ShadowsInfo) {
-    let num_circles = *rng.choice(&[5, 7, 10, 20, 30, 60]);
+fn shadows_params(rng: &mut Rng) -> ShadowsParams {
+    let num_circles: usize = *rng.choice(&[5, 7, 10, 20, 30, 60]);
+    let p_square = *rng.choice(&[0.0, 0.5, 1.0]);
+    let columnar_square = rng.odds(0.5);
+    let outward_radial = rng.odds(0.5);
+    ShadowsParams {
+        num_circles,
+        p_square,
+        columnar_square,
+        outward_radial,
+    }
+}
+
+fn shadows(p: ShadowsParams, rng: &mut Rng) -> (StartPointGroups, ShadowsInfo) {
+    let ShadowsParams {
+        num_circles,
+        p_square,
+        columnar_square,
+        outward_radial,
+    } = p;
     let num_circles_target = num_circles as u32;
     struct Circle {
         center: (f64, f64),
         radius: f64,
     }
-
-    let p_square = *rng.choice(&[0.0, 0.5, 1.0]);
-    let columnar_square = rng.odds(0.5);
-    let outward_radial = rng.odds(0.5);
 
     let collides = |c1: &Circle, c2: &Circle| {
         let d = dist(c1.center, c2.center);
@@ -362,7 +502,7 @@ fn shadows(rng: &mut Rng) -> (StartPointGroups, ShadowsInfo) {
     (StartPointGroups(groups), info)
 }
 
-fn formation(rng: &mut Rng) -> (StartPointGroups, FormationDims) {
+fn formation_params(rng: &mut Rng) -> FormationParams {
     let step = *rng.wc(&[
         (w(0.0075), 0.37),
         (w(0.01), 0.35),
@@ -387,12 +527,26 @@ fn formation(rng: &mut Rng) -> (StartPointGroups, FormationDims) {
         (5, 0.05),
         (7, 0.05),
     ]);
+    let skip_odds = *rng.wc(&[(0.0, 0.5), (0.1, 0.3), (0.2, 0.15), (0.5, 0.05)]);
+    FormationParams {
+        step,
+        num_horizontal_steps,
+        num_vertical_steps,
+        skip_odds,
+    }
+}
+
+fn formation(p: FormationParams, rng: &mut Rng) -> (StartPointGroups, FormationDims) {
+    let FormationParams {
+        step,
+        num_horizontal_steps,
+        num_vertical_steps,
+        skip_odds,
+    } = p;
     let step_frac = step / w(1.0);
 
     let horizontal_step_len = w(1.2) / num_horizontal_steps as f64;
     let vertical_step_len = h(1.2) / num_vertical_steps as f64;
-
-    let skip_odds = *rng.wc(&[(0.0, 0.5), (0.1, 0.3), (0.2, 0.15), (0.5, 0.05)]);
 
     let mut starting_chunks = Vec::with_capacity(num_horizontal_steps * num_vertical_steps);
     {
