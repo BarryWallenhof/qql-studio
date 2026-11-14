@@ -1,0 +1,45 @@
+# Builds a macOS disk image (.dmg) for QQL Studio on a GitHub-hosted runner.
+# Trigger manually from the Actions tab (workflow_dispatch) — the .dmg lands
+# as a downloadable artifact on the run page. It is a Universal build (Intel
+# and Apple Silicon). Builds are unsigned, so macOS warns on first launch:
+# right-click the app -> Open, or run
+#   xattr -dr com.apple.quarantine "/Applications/<app name>.app"
+name: macOS build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: qql-studio/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: qql-studio/src-tauri
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: qql-studio
+
+      - name: Build Tauri app
+        run: npm run tauri build -- --target universal-apple-darwin
+        working-directory: qql-studio
+
+      - name: Upload disk image
+        uses: actions/upload-artifact@v4
+        with:
+          name: qql-studio-macos
+          if-no-files-found: error
+          path: qql-studio/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
